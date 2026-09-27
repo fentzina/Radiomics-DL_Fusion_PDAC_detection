@@ -1,23 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 # STEP 6 — Patch-Based CNN Training (with Z-score normalization)
+α. κάθε patch θα τροφοδοτείται πλήρως μέσω του classifier head παράγοντας 1 ανεξάρτητη πιθανότητα PDAC, και το maximum αυτών των πιθανοτήτων αποτελεί την τελική πρόβλεψη ανά ασθενή, 
+β. ταυτόχρονα, να χρησιμοποιησω 4 patches και στο validation/test, αντί για ένα μόνο centroid patch (έτσι ωστε η διαδικασία είναι πανομοιότυπη και στα τρία subsets).
 
-Ένας συνδυασμός δύο αλλαγών:
-α. κάθε patch θα τροφοδοτείται πλήρως μέσω του classifier head 
-παράγοντας 1 ανεξάρτητη πιθανότητα PDAC, και το maximum αυτών των πιθανοτήτων αποτελεί την τελική πρόβλεψη ανά ασθενή, 
-και β. ταυτόχρονα, να χρησιμοποιησω 4 patches και στο validation/test, 
-αντί για ένα μόνο centroid patch (έτσι ωστε η διαδικασία είναι πανομοιότυπη και στα τρία subsets).
-
-Input  : {case_id}_image.npy   (128,128,128)  preprocessed, clipped CT
-         {case_id}_mask.npy    (128,128,128)  binary ROI masks  uint8
-         ids_train/val/test.npy, y_train/val/test.npy  (from Step 2)
-Output : best_cnn.pt
-         deep_embeddings_train/val/test.npy   → (N, 1) patient-level PDAC probabilities
-                                                 CHANGED from (N, embed_dim) embeddings
-         cnn_training_curves.png
-         zscore_stats.npz                     → CT_MEAN, CT_STD from training set
-
-Patch strategy (CHANGED from original):
+Patch strategy:
   - Training : 4 random patches per case → 4 probabilities → max → (N,1)
   - Val/Test : 4 seeded-random patches per case (deterministic, per-case seed)
                → 4 probabilities → mean → (N,1)
@@ -42,12 +29,10 @@ Z-score normalization:
 
 Input modes:
   - USE_COLIAGE=False → preprocessed+clipped CT, in_channels=1  (Z-score applied)
-  - USE_COLIAGE=True  → CoLIAGe feature maps, in_channels=28  (no Z-score)
+  - USE_COLIAGE=True  → CoLIAGe feature maps, in_channels=28  (no Z-score) -- not used here
 
 Simple3DCNN is a working placeholder. Replace with your own
 architecture by dropping it into the same forward() signature.
-
-# configure
 """
 
 import os
