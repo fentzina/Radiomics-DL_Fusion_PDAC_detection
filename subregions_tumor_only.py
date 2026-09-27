@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Central vs. Peripheral Subregion Radiomics Pipeline -- TUMOR-ONLY VERSION
-==========================================================================
 Processes ONLY PDAC-positive cases (label 1 present in segmentation).
 The guide mask for cropping and subregion splitting is the TUMOR mask alone
-(label == 1), NOT the tumor + pancreas union used in the previous version.
+(label == 1).
 
 Scientific motivation:
     This experiment isolates classical intra-tumor heterogeneity: the spatial
@@ -14,7 +13,7 @@ Scientific motivation:
 
 Key differences from central_peripheral_pipeline_v1.py:
   1. PDAC-ONLY FILTERING  -- non-PDAC cases (label 1 absent) are explicitly
-     skipped at the top of process_case(). Only the 676 PDAC cases are
+     skipped at the top of process_case(). Only the 589 PDAC cases are
      processed.
   2. TUMOR-ONLY GUIDE MASK -- guide_mask = (labels == TUMOR_LABEL), i.e.
      label 1 only. The pancreas (label 4) is excluded from both the crop
@@ -25,29 +24,12 @@ Key differences from central_peripheral_pipeline_v1.py:
   4. CONFIGURABLE SPLIT FRACTION -- --internal_fraction CLI argument controls
      the central/peripheral radius split (default 0.5 = inner 50% of max
      tumor radius is central, outer 50% is peripheral).
-  5. LINUX-READY -- log file written to --output_dir/pipeline.log; run with
-     nohup for SSH-resilient execution (see Usage below).
 
 Subregion split method (unchanged from v1):
     Central  = tumor voxels within internal_fraction * max_radius of centroid
     Peripheral = tumor voxels beyond that radius
     where max_radius = max Euclidean distance of any tumor voxel from centroid
     and voxel_spacing = (1,1,1) mm after isotropic resampling.
-
-Usage (Linux / cudalomi):
-    source ~/myenv_ftz/bin/activate
-    nohup python central_peripheral_pipeline_tumor_only.py \\
-        --data_dir    /path/to/batch_zips \\
-        --label_dir   /path/to/panorama_labels \\
-        --output_dir  /path/to/outputs \\
-        --internal_fraction 0.5 \\
-        > /path/to/outputs/pipeline.log 2>&1 &
-
-    # Monitor:
-    tail -f /path/to/outputs/pipeline.log
-
-    # Check if running:
-    ps aux | grep central_peripheral_pipeline_tumor_only.py
 """
 
 import os
