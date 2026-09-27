@@ -2,10 +2,7 @@
 """
 Automated Central vs. Peripheral Subregion Radiomics Pipeline -- batch mode.
 
-This is GIANADOYME_central_peripheral_ORIGINAL.py (single-case, Colab-manual,
-min-max normalized, whole-tumor + subregion CoLIAGe) rebuilt to match
-batch_coliage_pipeline_FIXED.py (allilouia.py)'s automatic batch driver, but
-scoped down to ONLY the central/peripheral subregion analysis:
+This is .py scoped down to ONLY the central/peripheral subregion analysis:
 
   1. AUTOMATIC BATCH PROCESSING -- instead of gdown-ing one hardcoded case
      and cloning panorama_labels by hand, this script discovers and unzips
@@ -21,9 +18,7 @@ scoped down to ONLY the central/peripheral subregion analysis:
      normalization that used to be applied before saving. CoLIAGe now runs
      ONLY on the two subregions.
 
-  3. CENTRAL vs. PERIPHERAL SUBREGION SPLIT (kept, and is now the whole
-     pipeline) -- GIANADOYME's "13b. CENTRAL vs. PERIPHERAL SUBREGION SPLIT
-     (heterogeneity analysis)" logic is preserved: the guide mask is split
+  3. CENTRAL vs. PERIPHERAL SUBREGION SPLIT : the guide mask is split
      into central/peripheral subregions by radial distance from its
      centroid, CoLIAGe is run separately on each subregion (reusing the same
      padded CT crop and Collage class), and each subregion's raw (non-
@@ -84,24 +79,12 @@ SVD_RADIUS = 3
 PAD_Z = 1                        # gradient edge margin, applies to the Z axis only
 INTERNAL_FRACTION = 0.5          # central-vs-peripheral split radius fraction
 
-# =========================================================================
 # HELPER FUNCTIONS
-# =========================================================================
-
 def get_full_stem(path):
     """
     Returns the filename with .nii/.nii.gz stripped, and NOTHING else stripped.
     This matches the original notebook's case-ID convention exactly, e.g.
     '100815_00001.nii.gz' -> '100815_00001'.
-
-    IMPORTANT: earlier versions of this script also stripped the last
-    underscore-separated segment (assuming an nnU-Net-style '..._0000'
-    modality suffix). That is UNSAFE as a default: the notebook's own example
-    filename '100815_00001.nii.gz' has two underscore-separated parts with no
-    modality suffix, and blind stripping would collapse it to '100815',
-    silently merging it with any other case sharing that first segment
-    (e.g. a different study/series for the same patient). Do not reintroduce
-    that behaviour here.
     """
     basename = os.path.basename(path)
     if basename.endswith('.nii.gz'):
@@ -204,10 +187,7 @@ def get_crop_coords(guide_mask, target_shape):
     return z_start, z_end, y_start, y_end, x_start, x_end
 
 
-# =========================================================================
 # COLIAGE CORE CLASS IMPLEMENTATIONS
-# =========================================================================
-
 def _svd_dominant_angles(dx, dy, dz, svd_radius):
     is_3D = dx.shape[2] > 1
     svd_diameter = svd_radius * 2 + 1
@@ -355,10 +335,7 @@ class Collage:
         return collage_output
 
 
-# =========================================================================
-# CENTRAL vs. PERIPHERAL HETEROGENEITY HELPERS  (from GIANADOYME "13b")
-# =========================================================================
-
+# CENTRAL vs. PERIPHERAL HETEROGENEITY HELPERS 
 def split_central_peripheral(mask, voxel_spacing=(1.0, 1.0, 1.0), internal_fraction=INTERNAL_FRACTION):
     """
     Splits a binary mask into central and peripheral subregions based on
@@ -432,7 +409,7 @@ def summarize_features(haralick_zyx, mask_128):
 
 def compute_central_peripheral_heterogeneity(ct_padded, guide_mask_128_zyx, svd_radius, pad_z):
     """
-    Runs the "13b" central-vs-peripheral heterogeneity analysis for a single
+    Runs the central-vs-peripheral heterogeneity analysis for a single
     case -- this IS the pipeline's output, there is no separate whole-tumor
     pass. Returns a dict with the central vector, peripheral vector,
     heterogeneity vector, and the two subregion masks (all at TARGET_SHAPE
@@ -476,10 +453,7 @@ def compute_central_peripheral_heterogeneity(ct_padded, guide_mask_128_zyx, svd_
     }
 
 
-# =========================================================================
 # CORE PROCESSING PIPELINE
-# =========================================================================
-
 def process_case(ct_path, label_path, output_dir, case_id):
     logger.info(f"--- Processing Case: {case_id} ---")
 
@@ -522,9 +496,7 @@ def process_case(ct_path, label_path, output_dir, case_id):
     # Clip HU intensities
     clipped_ct_numpy = np.clip(ct_resampled_numpy, HU_MIN, HU_MAX)
 
-    # =========================================================================
     # 1. CROP TO 128^3 FIRST (matching the original notebook exactly)
-    # =========================================================================
     if (z_end - z_start, y_end - y_start, x_end - x_start) != TARGET_SHAPE:
         raise ValueError("Crop size did not match TARGET_SHAPE")
 
@@ -544,7 +516,6 @@ def process_case(ct_path, label_path, output_dir, case_id):
             f"Depth {_3d_image_for_collage_yxz.shape[2]} < 3 -- not enough for 3D CoLIAGe"
         )
 
-    # =========================================================================
     # 2. PAD THE 128^3 CROP  (shared CT input for both subregion CoLIAGe runs)
     #    Array axis order here is (Y, X, Z). The SVD dominant-orientation window
     #    is 2D over (Y, X) with diameter 2*SVD_RADIUS+1, so BOTH Y and X need a
@@ -552,7 +523,6 @@ def process_case(ct_path, label_path, output_dir, case_id):
     #    1-slice margin (PAD_Z) for the finite-difference gradient at the
     #    volume edge. NOTE: no whole-tumor/whole-guide-mask CoLIAGe pass is
     #    run here -- only the two subregions below are processed.
-    # =========================================================================
     ct_padded = np.pad(
         _3d_image_for_collage_yxz,
         ((SVD_RADIUS, SVD_RADIUS), (SVD_RADIUS, SVD_RADIUS), (PAD_Z, PAD_Z)),
@@ -572,14 +542,12 @@ def process_case(ct_path, label_path, output_dir, case_id):
     np.save(os.path.join(img_dir, f"{clean_case_id}_image.npy"), _3d_image_for_collage_yxz)
     np.save(os.path.join(mask_dir, f"{clean_case_id}_mask.npy"), _3d_mask_for_collage_yxz.astype(np.uint8))
 
-    # =========================================================================
-    # 3. CENTRAL vs. PERIPHERAL SUBREGION SPLIT (heterogeneity analysis, "13b")
+    # 3. CENTRAL vs. PERIPHERAL SUBREGION SPLIT
     #    This IS the pipeline's output now: CoLIAGe runs ONLY on the central
     #    and peripheral subregions of the guide mask, raw (no normalization).
     #    If a subregion is empty or too small for CoLIAGe, this raises and the
     #    case is marked failed by the caller -- there is no whole-tumor
     #    fallback to save instead.
-    # =========================================================================
     het = compute_central_peripheral_heterogeneity(
         ct_padded, _3d_cropped_mask_zyx.astype(bool), SVD_RADIUS, PAD_Z
     )
@@ -600,10 +568,7 @@ def process_case(ct_path, label_path, output_dir, case_id):
     )
 
 
-# =========================================================================
 # BATCH (ZIP) HELPERS
-# =========================================================================
-
 def find_batch_zips(data_dir):
     """
     Returns a sorted list of batch_*.zip files directly inside data_dir
@@ -728,10 +693,7 @@ def process_one_ct_file(ct_file, label_lookup, output_dir):
         return "failed"
 
 
-# =========================================================================
 # MAIN ARGUMENT PARSING LOGIC
-# =========================================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description="Process CT files for CoLIAGe central/peripheral heterogeneity analysis. "
