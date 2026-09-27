@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 Automated 3D CT Preprocessing & CoLIAGe Feature Extraction Pipeline -- batch mode.
-
-This is fml_fixed_NEW.py with the exact same per-case processing logic
-(helper functions, Collage class, process_case -- byte-for-byte unchanged),
-but with a batch driver on top that automatically works through several
-zipped batches of CT scans instead of a single --ct_dir folder.
-
 Usage:
     python batch_coliage_pipeline_FIXED.py \
         --data_dir ./data \
