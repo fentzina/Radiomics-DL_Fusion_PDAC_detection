@@ -1,0 +1,768 @@
+# -*- coding: utf-8 -*-
+"""
+# STEP 6 — Patch-Based CNN Training (with Z-score normalization)
+
+Ένας συνδυασμός δύο αλλαγών:
+α. κάθε patch θα τροφοδοτείται πλήρως μέσω του classifier head 
+παράγοντας 1 ανεξάρτητη πιθανότητα PDAC, και το maximum αυτών των πιθανοτήτων αποτελεί την τελική πρόβλεψη ανά ασθενή, 
+και β. ταυτόχρονα, να χρησιμοποιησω 4 patches και στο validation/test, 
+αντί για ένα μόνο centroid patch (έτσι ωστε η διαδικασία είναι πανομοιότυπη και στα τρία subsets).
+
+Input  : {case_id}_image.npy   (128,128,128)  preprocessed, clipped CT
+         {case_id}_mask.npy    (128,128,128)  binary ROI masks  uint8
+         ids_train/val/test.npy, y_train/val/test.npy  (from Step 2)
+Output : best_cnn.pt
+         deep_embeddings_train/val/test.npy   → (N, 1) patient-level PDAC probabilities
+                                                 CHANGED from (N, embed_dim) embeddings
+         cnn_training_curves.png
+         zscore_stats.npz                     → CT_MEAN, CT_STD from training set
+
+Patch strategy (CHANGED from original):
+  - Training : 4 random patches per case → 4 probabilities → max → (N,1)
+  - Val/Test : 4 seeded-random patches per case (deterministic, per-case seed)
+               → 4 probabilities → mean → (N,1)
+               CHANGED from: 1 centroid patch → 1 embedding
+  - Patch size: 64³ voxels
+  - Augmentation: random axis flips (train only, during training loop)
+  - Aggregation: decision-level mean of patch probabilities (not embedding mean)
+  - Symmetry: train/val/test all use the same 4-patch aggregation procedure
+
+Z-score normalization:
+  - CT_MEAN and CT_STD are computed from ALL training-set image.npy files
+    using a single pass (online sum / sum-of-squares accumulation).
+  - Statistics are computed ONCE and saved to zscore_stats.npz so
+    subsequent runs skip the scan.
+  - Every CT patch is normalized as (patch - CT_MEAN) / CT_STD
+    inside PatchDataset.__getitem__, applied AFTER patch extraction.
+  - Val and test patches use the SAME training-set statistics
+    (fit on train, transform all) — consistent with StandardScaler
+    discipline in the radiomic branch.
+  - CoLIAGe mode (USE_COLIAGE=True) skips Z-score normalization since
+    Haralick texture maps are on their own scales.
+
+Input modes:
+  - USE_COLIAGE=False → preprocessed+clipped CT, in_channels=1  (Z-score applied)
+  - USE_COLIAGE=True  → CoLIAGe feature maps, in_channels=28  (no Z-score)
+
+Simple3DCNN is a working placeholder. Replace with your own
+architecture by dropping it into the same forward() signature.
+
+# configure
+"""
+
+import os
+import numpy as np
+import torch
+torch.backends.cudnn.enabled = False
+
+import torch.nn as nn
+from torch.utils.data   import Dataset, DataLoader
+from sklearn.metrics    import roc_auc_score
+import matplotlib
+matplotlib.use("Agg")   # headless Linux: no display available, render straight to file
+import matplotlib.pyplot as plt
+
+# CONFIG — edit before running
+IMAGE_DIR        = "/home/student1/ftzina_thesis/step6/ALL_METRICS_FULL/ALL_IMAGES_FULL"        # {case_id}_image.npy   (128,128,128)
+MASK_DIR         = "/home/student1/ftzina_thesis/step6/ALL_METRICS_FULL/ALL_MASKS_FULL"         # {case_id}_mask.npy    (128,128,128)
+# COLIAGE_DIR      = "/content/drive/MyDrive/metrics_batch1/ALL_TENSORS/npy files"       # {case_id}_coliage.npy (128,128,128,28)
+SPLIT_DIR        = "/home/student1/ftzina_thesis/step6/step2_outputs"            # ids_*.npy, y_*.npy from Step 2
+OUTPUT_DIR       = "/home/student1/ftzina_thesis/step6/step6_outputs2"
+
+USE_COLIAGE      = False    # True → 28-channel CoLIAGe input; False → 1-ch raw CT
+COLIAGE_DIR      = None     # set path if USE_COLIAGE=True
+PATCH_SIZE       = 64       # cubic patch side length in voxels
+PATCHES_PER_CASE = 4        # patches sampled per case per epoch (train only)
+EMBED_DIM        = 128      # CNN output embedding dimension
+BATCH_SIZE       = 4        # keep small for 3D patches (memory)
+N_EPOCHS         = 50
+LR               = 1e-4
+WEIGHT_DECAY     = 1e-4
+PATIENCE         = 10       # early stopping on val AUC
+RANDOM_STATE     = 42
+NUM_WORKERS      = 4        # set 0 on Windows
+
+# ── Z-score normalization ─────────────────────────────────────────────────────
+# Z-score statistics (mean, std) are computed from TRAINING images ONLY,
+# then applied consistently to val and test — fit on train, transform all.
+# This file is saved after the first run so subsequent runs skip recomputation.
+# Set to None to recompute from scratch.
+APPLY_ZSCORE         = True
+ZSCORE_STATS_FILE    = os.path.join(OUTPUT_DIR, "zscore_stats.npz")
+# ─────────────────────────────────────────────────────────────────────────────
+
+torch.manual_seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Console -> file logging ────────────────────────────────────────────────
+# No display on this machine, so mirror every print() to a .txt log as well
+# as the terminal. Pull the log (and the saved .png files) off this machine
+# afterward to inspect metrics / regenerate plots elsewhere.
+import sys
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+LOG_FILE = os.path.join(OUTPUT_DIR, "step6_run_log.txt")
+_log_fh  = open(LOG_FILE, "a", encoding="utf-8")
+sys.stdout = _Tee(sys.__stdout__, _log_fh)
+sys.stderr = _Tee(sys.__stderr__, _log_fh)
+print(f"Logging console output to: {LOG_FILE}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+"""# Patch utilities"""
+
+def get_roi_centroid(mask: np.ndarray) -> np.ndarray:
+    """
+    Returns integer (y, x, z) centroid of a binary mask.
+    mask: (H, W, D) uint8 or bool
+    """
+    coords = np.argwhere(mask.astype(bool))
+    assert len(coords) > 0, "Empty mask — cannot compute centroid."
+    return coords.mean(axis=0).astype(int)
+
+def extract_patch(volume: np.ndarray,
+                  center: np.ndarray,
+                  patch_size: int = 64) -> np.ndarray:
+    """
+    Extract a cubic patch centered at `center` from `volume`.
+    Zero-pads if patch extends beyond volume boundary.
+
+    volume     : (H, W, D)        or (H, W, D, C)
+    center     : (3,) int array   [y, x, z]
+    patch_size : int
+
+    Returns    : (P, P, P)        or (P, P, P, C)
+    """
+    H, W, D = volume.shape[:3]
+    p  = patch_size // 2
+    cy, cx, cz = int(center[0]), int(center[1]), int(center[2])
+
+    y0, y1 = cy - p, cy + p
+    x0, x1 = cx - p, cx + p
+    z0, z1 = cz - p, cz + p
+
+    y0c, y1c = max(0, y0), min(H, y1)
+    x0c, x1c = max(0, x0), min(W, x1)
+    z0c, z1c = max(0, z0), min(D, z1)
+
+    crop = (volume[y0c:y1c, x0c:x1c, z0c:z1c]
+            if volume.ndim == 3
+            else volume[y0c:y1c, x0c:x1c, z0c:z1c, :])
+
+    pad_w = [
+        (y0c - y0, y1 - y1c),
+        (x0c - x0, x1 - x1c),
+        (z0c - z0, z1 - z1c),
+    ]
+    if volume.ndim == 4:
+        pad_w.append((0, 0))
+
+    return np.pad(crop, pad_w, mode="constant", constant_values=0)
+
+def sample_random_roi_centers(mask: np.ndarray,
+                               n_samples: int = 4,
+                               patch_size: int = 64) -> list:
+    """
+    Sample n_samples random patch centers from within the ROI mask,
+    filtered to only positions where a full patch fits inside the volume.
+
+    Returns list of (y, x, z) integer arrays.
+    """
+    H, W, D = mask.shape
+    p = patch_size // 2
+    roi_coords = np.argwhere(mask.astype(bool))
+
+    # Only keep centers where the patch fits entirely inside the volume
+    valid = roi_coords[
+        (roi_coords[:, 0] >= p) & (roi_coords[:, 0] < H - p) &
+        (roi_coords[:, 1] >= p) & (roi_coords[:, 1] < W - p) &
+        (roi_coords[:, 2] >= p) & (roi_coords[:, 2] < D - p)
+    ]
+
+    if len(valid) == 0:
+        # ROI too small or too close to boundary — fall back to centroid
+        return [get_roi_centroid(mask)]
+
+    replace = len(valid) < n_samples
+    idx = np.random.choice(len(valid), size=n_samples, replace=replace)
+    return [valid[i] for i in idx]
+
+"""# Dataset"""
+
+class PatchDataset(Dataset):
+    """
+    Patch-based 3D dataset.
+
+    For training   : samples PATCHES_PER_CASE random ROI patches per case.
+    For val / test : extracts ONE centroid patch per case (deterministic).
+
+    Parameters
+    ----------
+    case_ids         : list[str]
+    labels           : dict {case_id: int}
+    image_dir        : str  — directory with {case_id}_image.npy
+    mask_dir         : str  — directory with {case_id}_mask.npy
+    patch_size       : int
+    patches_per_case : int  — set to 1 for val/test
+    use_coliage      : bool — if True, load CoLIAGe as 28-channel input
+    coliage_dir      : str  — directory with {case_id}_coliage.npy
+    augment          : bool — random flips (training only)
+    """
+    def __init__(
+        self,
+        case_ids:         list,
+        labels:           dict,
+        image_dir:        str,
+        mask_dir:         str,
+        patch_size:       int   = 64,
+        patches_per_case: int   = 4,
+        use_coliage:      bool  = False,
+        coliage_dir:      str   = None,
+        augment:          bool  = False,
+        ct_mean:          float = 0.0,
+        ct_std:           float = 1.0,
+    ):
+        self.case_ids         = case_ids
+        self.labels           = labels
+        self.image_dir        = image_dir
+        self.mask_dir         = mask_dir
+        self.patch_size       = patch_size
+        self.patches_per_case = patches_per_case
+        self.use_coliage      = use_coliage
+        self.coliage_dir      = coliage_dir
+        self.augment          = augment
+        self.is_single_patch  = (patches_per_case == 1)
+        self.ct_mean          = ct_mean
+        self.ct_std           = max(ct_std, 1e-8)   # avoid division by zero
+
+        # Flat index: each entry is (case_id, patch_slot)
+        self.index = [
+            (cid, pi)
+            for cid in case_ids
+            for pi in range(patches_per_case)
+        ]
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        case_id, patch_slot = self.index[idx]
+        label = self.labels[case_id]
+
+        # ── Load mask ──────────────────────────────────────────────────────
+        mask_path = os.path.join(self.mask_dir, f"{case_id}_mask.npy")
+        mask = np.load(mask_path)                   # (128,128,128) uint8
+
+        # ── Choose patch center ────────────────────────────────────────────
+        if self.is_single_patch:
+            # Deterministic: use ROI centroid (for val/test)
+            center = get_roi_centroid(mask)
+        else:
+            # Random: sample from within ROI (for training)
+            centers = sample_random_roi_centers(
+                mask, n_samples=1, patch_size=self.patch_size
+            )
+            center = centers[0]
+
+        # ── Load volume and extract patch ──────────────────────────────────
+        if self.use_coliage:
+            # CoLIAGe: (128,128,128,28) → patch (P,P,P,28) → (28,P,P,P)
+            vol_path = os.path.join(self.coliage_dir, f"{case_id}_tensor_128_27ch.npy")
+            volume   = np.load(vol_path).astype(np.float32)
+            patch    = extract_patch(volume, center, self.patch_size)
+            patch    = patch.transpose(3, 0, 1, 2)        # (28, P, P, P)
+        else:
+            # Raw CT: (128,128,128) → patch (P,P,P) → (1,P,P,P)
+            vol_path = os.path.join(self.image_dir, f"{case_id}_image.npy")
+            volume   = np.load(vol_path).astype(np.float32)
+            patch    = extract_patch(volume, center, self.patch_size)
+
+            # ── Z-score normalization using training-set statistics ────────
+            # CT_MEAN and CT_STD were computed from training images only
+            # and passed in via ct_mean / ct_std constructor arguments.
+            # Normalizing here (after patch extraction) is equivalent to
+            # normalizing the full volume — patches are sub-volumes of the
+            # same intensity space.
+            patch = (patch - self.ct_mean) / self.ct_std
+
+            patch    = patch[np.newaxis, ...]              # (1, P, P, P)
+
+        # ── Augmentation (training only) ───────────────────────────────────
+        if self.augment:
+            patch = self._random_flip(patch)
+
+        return (
+            torch.tensor(patch,         dtype=torch.float32),
+            torch.tensor(label,         dtype=torch.float32),
+            case_id,                                      # returned for tracking
+        )
+
+    @staticmethod
+    def _random_flip(patch: np.ndarray) -> np.ndarray:
+        """Random flip along each spatial axis (axes 1,2,3)."""
+        for axis in [1, 2, 3]:
+            if np.random.rand() > 0.5:
+                patch = np.flip(patch, axis=axis).copy()
+        return patch
+
+"""# **Simple3DCNN**"""
+
+# Model — Simple 3D CNN placeholder
+# Replace self.encoder / embed_head with your real architecture.
+# Keep the same forward() signature.
+
+class Simple3DCNN(nn.Module):
+    """
+    Lightweight 3D CNN for patch classification and embedding extraction.
+
+    Input : (batch, C_in, 64, 64, 64)
+    Output: (batch,) logit         when return_embedding=False
+            (batch, embed_dim)     when return_embedding=True
+    """
+    def __init__(self, in_channels: int = 1, embed_dim: int = 128):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            # Block 1: C × 64³ → 32 × 32³
+            nn.Conv3d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(32), nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
+
+            # Block 2: 32 × 32³ → 64 × 16³
+            nn.Conv3d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(64), nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
+
+            # Block 3: 64 × 16³ → 128 × 8³
+            nn.Conv3d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(128), nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
+
+            # Block 4: 128 × 8³ → 256 × 4³
+            nn.Conv3d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(256), nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
+        )
+
+        self.gap = nn.AdaptiveAvgPool3d(1)   # → (batch, 256, 1, 1, 1)
+
+        self.embed_head = nn.Sequential(
+            nn.Flatten(),                     # → (batch, 256)
+            nn.Linear(256, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+        )
+
+        self.classifier = nn.Linear(embed_dim, 1)
+
+    def forward(self, x: torch.Tensor,
+                return_embedding: bool = False) -> torch.Tensor:
+        feat = self.encoder(x)
+        feat = self.gap(feat)
+        emb  = self.embed_head(feat)
+
+        if return_embedding:
+            return emb                              # (batch, embed_dim)
+        return self.classifier(emb).squeeze(1)     # (batch,)
+
+"""# Load splits"""
+
+id_train = np.load(os.path.join(SPLIT_DIR, "ids_train.npy"), allow_pickle=True)
+id_val   = np.load(os.path.join(SPLIT_DIR, "ids_val.npy"),   allow_pickle=True)
+id_test  = np.load(os.path.join(SPLIT_DIR, "ids_test.npy"),  allow_pickle=True)
+
+y_train  = np.load(os.path.join(SPLIT_DIR, "y_train.npy"))
+y_val    = np.load(os.path.join(SPLIT_DIR, "y_val.npy"))
+y_test   = np.load(os.path.join(SPLIT_DIR, "y_test.npy"))
+
+# Build label lookup
+labels = {}
+for ids_arr, ys in [(id_train, y_train), (id_val, y_val), (id_test, y_test)]:
+    for cid, y in zip(ids_arr, ys):
+        labels[str(cid)] = int(y)
+
+print(f"Cases — train:{len(id_train)}  val:{len(id_val)}  test:{len(id_test)}")
+print(f"Patches per epoch (train): {len(id_train) * PATCHES_PER_CASE}")
+print(f"Input mode: {'CoLIAGe (28ch)' if USE_COLIAGE else 'Raw CT (1ch)'}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Z-SCORE NORMALIZATION — compute mean/std from training images ONLY
+# Applied per-volume: each patch is normalized using the global training stats.
+# This follows the same discipline as StandardScaler in the radiomic branch:
+#   fit on training data only → transform all splits consistently.
+# ─────────────────────────────────────────────────────────────────────────────
+if APPLY_ZSCORE and not USE_COLIAGE:
+    if ZSCORE_STATS_FILE is not None and os.path.exists(ZSCORE_STATS_FILE):
+        stats      = np.load(ZSCORE_STATS_FILE)
+        CT_MEAN    = float(stats["mean"])
+        CT_STD     = float(stats["std"])
+        print(f"\nZ-score stats loaded from {ZSCORE_STATS_FILE}")
+        print(f"  CT_MEAN = {CT_MEAN:.4f} HU   CT_STD = {CT_STD:.4f} HU")
+    else:
+        print(f"\nComputing Z-score statistics from {len(id_train)} training images...")
+        pixel_sum   = 0.0
+        pixel_sum_sq = 0.0
+        pixel_count  = 0
+
+        for cid in id_train:
+            img_path = os.path.join(IMAGE_DIR, f"{cid}_image.npy")
+            if not os.path.exists(img_path):
+                continue
+            img = np.load(img_path).astype(np.float32)
+            pixel_sum    += img.sum()
+            pixel_sum_sq += (img ** 2).sum()
+            pixel_count  += img.size
+
+        CT_MEAN = pixel_sum / pixel_count
+        CT_VAR  = (pixel_sum_sq / pixel_count) - (CT_MEAN ** 2)
+        CT_STD  = float(np.sqrt(max(CT_VAR, 1e-8)))
+
+        np.savez(ZSCORE_STATS_FILE, mean=CT_MEAN, std=CT_STD)
+        print(f"  CT_MEAN = {CT_MEAN:.4f} HU   CT_STD = {CT_STD:.4f} HU")
+        print(f"  Computed over {pixel_count:,} voxels from {len(id_train)} cases")
+        print(f"  Saved to {ZSCORE_STATS_FILE}")
+else:
+    CT_MEAN = 0.0
+    CT_STD  = 1.0
+    if not APPLY_ZSCORE:
+        print("\nZ-score normalization disabled (APPLY_ZSCORE=False).")
+    else:
+        print("\nZ-score normalization skipped for CoLIAGe input mode.")
+
+"""# DataLoaders"""
+
+_common = dict(
+    image_dir        = IMAGE_DIR,
+    mask_dir         = MASK_DIR,
+    patch_size       = PATCH_SIZE,
+    use_coliage      = USE_COLIAGE,
+    coliage_dir      = COLIAGE_DIR,
+    ct_mean          = CT_MEAN,    # training-set Z-score mean (0.0 if disabled)
+    ct_std           = CT_STD,     # training-set Z-score std  (1.0 if disabled)
+)
+
+train_dataset = PatchDataset(
+    case_ids         = list(id_train),
+    labels           = labels,
+    patches_per_case = PATCHES_PER_CASE,
+    augment          = True,
+    **_common,
+)
+val_dataset = PatchDataset(
+    case_ids         = list(id_val),
+    labels           = labels,
+    patches_per_case = 1,
+    augment          = False,
+    **_common,
+)
+test_dataset = PatchDataset(
+    case_ids         = list(id_test),
+    labels           = labels,
+    patches_per_case = 1,
+    augment          = False,
+    **_common,
+)
+
+def collate_fn(batch):
+    """Custom collate that keeps case_id strings separate from tensors."""
+    patches  = torch.stack([b[0] for b in batch])
+    labels_t = torch.stack([b[1] for b in batch])
+    case_ids = [b[2] for b in batch]
+    return patches, labels_t, case_ids
+
+train_loader = DataLoader(
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn,
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, collate_fn=collate_fn,
+)
+test_loader = DataLoader(
+    test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, collate_fn=collate_fn,
+)
+
+"""# Model, optimizer, loss"""
+
+# @title
+in_channels = 28 if USE_COLIAGE else 1
+model       = Simple3DCNN(in_channels=in_channels, embed_dim=EMBED_DIM).to(device)
+optimizer   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler   = torch.optim.lr_scheduler.LinearLR(
+    optimizer, start_factor=1.0, end_factor=0.1, total_iters=N_EPOCHS
+)
+
+n_neg, n_pos = int((y_train == 0).sum()), int((y_train == 1).sum())
+pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) # With your numbers: 1092 / 473 ≈ 2.31
+
+total_params  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\nModel parameters: {total_params:,}")
+print(f"Positive class weight: {pos_weight.item():.3f}  "
+      f"(non-PDAC={n_neg}, PDAC={n_pos})\n")
+
+"""# Training loop"""
+
+best_val_auc = 0.0
+no_improve   = 0
+history      = {"train_loss": [], "val_auc": []}
+
+print("── Training " + "─" * 50)
+
+for epoch in range(N_EPOCHS):
+
+    # ── Train ──────────────────────────────────────────────────────────────
+    model.train()
+    epoch_loss = 0.0
+
+    for X_batch, y_batch, _ in train_loader:
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
+        optimizer.zero_grad()
+        logits = model(X_batch)
+        loss   = criterion(logits, y_batch)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    scheduler.step()
+    avg_loss = epoch_loss / len(train_loader)
+
+    # ── Validate ───────────────────────────────────────────────────────────
+    model.eval()
+    all_probs, all_labels_val = [], []
+
+    with torch.no_grad():
+        for X_batch, y_batch, _ in val_loader:
+            logits = model(X_batch.to(device))
+            probs  = torch.sigmoid(logits).cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels_val.extend(y_batch.numpy().tolist())
+
+    val_auc = roc_auc_score(all_labels_val, all_probs)
+    history["train_loss"].append(avg_loss)
+    history["val_auc"].append(val_auc)
+
+    flag = ""
+    if val_auc > best_val_auc + 1e-4:
+        best_val_auc = val_auc
+        torch.save(model.state_dict(),
+                   os.path.join(OUTPUT_DIR, "best_cnn.pt"))
+        no_improve = 0
+        flag = "  ✓ saved"
+    else:
+        no_improve += 1
+
+    print(f"Epoch {epoch+1:02d}/{N_EPOCHS} | "
+          f"Loss: {avg_loss:.4f} | Val AUC: {val_auc:.4f}{flag}")
+
+    if no_improve >= PATIENCE:
+        print(f"\nEarly stopping at epoch {epoch+1}.")
+        break
+
+# ── Training curves ───────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(history["train_loss"], color="steelblue")
+axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCE Loss")
+axes[0].set_title("Training Loss")
+
+axes[1].plot(history["val_auc"], color="tomato")
+axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("ROC-AUC")
+axes[1].set_title("Validation AUC")
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "cnn_training_curves.png"), dpi=150)
+plt.close()
+
+"""# Extract embeddings for all splits (one centroid patch per case)"""
+
+# CHANGED: now extracting patient-level PDAC probabilities (not embeddings)
+# Train: mean of 4 patch-level probabilities per case (decision-level aggregation)
+# Val/Test: mean of 4 seeded-random-patch probabilities per case (symmetric with train)
+print("── Extracting patient-level probabilities ──")
+print("   Train : mean of 4 patch PDAC probabilities per case")
+print("   Val   : mean of 4 seeded-patch PDAC probabilities per case")
+print("   Test  : mean of 4 seeded-patch PDAC probabilities per case\n")
+
+model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "best_cnn.pt"), map_location=device))
+model.eval()
+
+# @title
+def extract_train_embeddings(case_ids_ordered: np.ndarray) -> np.ndarray:
+    """
+    CHANGED: Decision-level probability averaging instead of embedding averaging.
+
+    Training split: each of the PATCHES_PER_CASE patches per case is passed
+    through the full CNN including the classifier head (return_embedding=False),
+    producing one PDAC probability per patch. These probabilities are then
+    averaged into a single scalar patient-level prediction.
+
+    This is a decision-level aggregation: each patch acts as an independent
+    spatial view of the tumor, producing its own PDAC probability, and the
+    patient-level prediction is the MAX of those probabilities.
+
+    Output shape: (N, 1) — one probability per patient (not (N, 128) embeddings).
+    """
+    # Build a dedicated loader: patches_per_case=PATCHES_PER_CASE,
+    # augment=False (no flips during extraction),
+    # shuffle=False (preserve case grouping for averaging)
+    train_emb_dataset = PatchDataset(
+        case_ids         = list(case_ids_ordered),
+        labels           = labels,
+        image_dir        = IMAGE_DIR,
+        mask_dir         = MASK_DIR,
+        patch_size       = PATCH_SIZE,
+        patches_per_case = PATCHES_PER_CASE,
+        use_coliage      = USE_COLIAGE,
+        coliage_dir      = COLIAGE_DIR,
+        augment          = False,               # no augmentation during extraction
+        ct_mean          = CT_MEAN,
+        ct_std           = CT_STD,
+    )
+    train_emb_loader = DataLoader(
+        train_emb_dataset,
+        batch_size  = BATCH_SIZE,
+        shuffle     = False,    # must be False — order matters for averaging
+        num_workers = NUM_WORKERS,
+        collate_fn  = collate_fn,
+    )
+
+    # CHANGED: collect per-patch PDAC probabilities (not embeddings) per case_id
+    prob_accumulator = {}   # case_id → list of scalar probabilities
+
+    with torch.no_grad():
+        for X_batch, _, case_ids_batch in train_emb_loader:
+            # CHANGED: return_embedding=False → full forward pass through classifier head
+            logits = model(X_batch.to(device), return_embedding=False)
+            probs  = torch.sigmoid(logits).cpu().numpy()   # (batch,) scalar probabilities
+            for cid, prob in zip(case_ids_batch, probs):
+                cid = str(cid)
+                if cid not in prob_accumulator:
+                    prob_accumulator[cid] = []
+                prob_accumulator[cid].append(float(prob))
+
+    # CHANGED: ΜΑΧ patch-level probabilities → one scalar per patient
+    # Output is (N, 1) to maintain consistent array shape for downstream use
+    prob_matrix = np.array([
+        [np.max(prob_accumulator[str(cid)])] #[np.mean(prob_accumulator[str(cid)])]
+        for cid in case_ids_ordered
+    ])
+    print(f"  train: {prob_matrix.shape}  "
+          f"(averaged {PATCHES_PER_CASE} patch probabilities × {len(case_ids_ordered)} cases)")
+    return prob_matrix.astype(np.float32)
+
+# @title
+def extract_centroid_embeddings(loader,
+                                 case_ids_ordered: np.ndarray,
+                                 split_name: str) -> np.ndarray:
+    """
+    CHANGED: Val / test splits now use 4 seeded random patches per case
+    instead of 1 centroid patch, matching the training procedure.
+
+    Previously: 1 centroid patch → 1 embedding (asymmetric with training).
+    Now: PATCHES_PER_CASE patches per case, sampled with a per-case fixed
+    random seed (deterministic and reproducible), each passing through the
+    full classifier head to produce a PDAC probability. The mean of those
+    probabilities is the patient-level prediction.
+
+    Output shape: (N, 1) — one probability per patient, consistent with
+    extract_train_embeddings output shape.
+    """
+    prob_dict = {}
+
+    with torch.no_grad():
+        for case_id in case_ids_ordered:
+            case_id_str = str(case_id)
+
+            # Load mask and image for this case
+            mask_path = os.path.join(MASK_DIR, f"{case_id_str}_mask.npy")
+            img_path  = os.path.join(IMAGE_DIR, f"{case_id_str}_image.npy")
+            mask   = np.load(mask_path)
+            volume = np.load(img_path).astype(np.float32)
+
+            # CHANGED: sample PATCHES_PER_CASE patches with a fixed per-case seed
+            # This is deterministic and reproducible across runs, replacing the
+            # single centroid patch that was used previously.
+            rng = np.random.default_rng(
+                seed=abs(hash(case_id_str)) % (2 ** 32)
+            )
+            centers = sample_random_roi_centers(
+                mask, n_samples=PATCHES_PER_CASE, patch_size=PATCH_SIZE
+            )
+            # Override the global random state with the seeded one for this case
+            replace = len(np.argwhere(mask.astype(bool))) < PATCHES_PER_CASE
+            roi_coords = np.argwhere(mask.astype(bool))
+            p = PATCH_SIZE // 2
+            H, W, D = mask.shape
+            valid = roi_coords[
+                (roi_coords[:, 0] >= p) & (roi_coords[:, 0] < H - p) &
+                (roi_coords[:, 1] >= p) & (roi_coords[:, 1] < W - p) &
+                (roi_coords[:, 2] >= p) & (roi_coords[:, 2] < D - p)
+            ]
+            if len(valid) == 0:
+                centers = [get_roi_centroid(mask)] * PATCHES_PER_CASE
+            else:
+                idx     = rng.choice(len(valid), size=PATCHES_PER_CASE,
+                                     replace=len(valid) < PATCHES_PER_CASE)
+                centers = [valid[i] for i in idx]
+
+            patch_probs = []
+            for center in centers:
+                patch = extract_patch(volume, center, PATCH_SIZE)
+                # Apply same z-score normalization used during training
+                patch = (patch - CT_MEAN) / max(CT_STD, 1e-8)
+                patch = patch[np.newaxis, np.newaxis, ...]    # (1, 1, P, P, P)
+                x     = torch.tensor(patch, dtype=torch.float32).to(device)
+
+                # CHANGED: return_embedding=False → full pass through classifier head
+                logit = model(x, return_embedding=False)
+                prob  = torch.sigmoid(logit).item()
+                patch_probs.append(prob)
+
+            # max of patch-level probabilities = patient-level prediction
+            prob_dict[case_id_str] = np.max(patch_probs) #prob_dict[case_id_str] = np.mean(patch_probs)
+
+    # Stack into (N, 1) array — consistent shape with extract_train_embeddings
+    prob_matrix = np.array([[prob_dict[str(cid)]] for cid in case_ids_ordered])
+    print(f"  {split_name}: {prob_matrix.shape}  "
+          f"({PATCHES_PER_CASE} seeded patches per case, max probability taken)")
+    return prob_matrix.astype(np.float32)
+
+# CHANGED: extract patient-level probabilities (not embeddings) for all three splits.
+# extract_centroid_embeddings no longer uses the DataLoader — it iterates case_ids
+# directly and loads images/masks per case to apply seeded random patch sampling.
+# The loader arguments are removed; only case_ids_ordered and split_name are needed.
+deep_train = extract_train_embeddings(id_train)
+deep_val   = extract_centroid_embeddings(None, id_val,  "val")   # loader arg unused
+deep_test  = extract_centroid_embeddings(None, id_test, "test")  # loader arg unused
+
+# CHANGED: output arrays are (N, 1) patient-level probabilities, not (N, 128) embeddings.
+# Saved with the same filenames so step7_fusion.py can load them unchanged.
+# NOTE: step7_fusion.py must be updated to expect (N,1) probabilities instead of
+# (N, 128) embeddings — the fusion strategy changes from embedding concatenation
+# to decision-level meta-learning on two scalar probabilities (CNN + radiomic).
+np.save(os.path.join(OUTPUT_DIR, "deep_embeddings_train.npy"), deep_train)
+np.save(os.path.join(OUTPUT_DIR, "deep_embeddings_val.npy"),   deep_val)
+np.save(os.path.join(OUTPUT_DIR, "deep_embeddings_test.npy"),  deep_test)
+
+print(f"\nSaved patient-level probabilities:")
+print(f"  deep_embeddings_train.npy → {deep_train.shape}  (N, 1) CNN probabilities")
+print(f"  deep_embeddings_val.npy   → {deep_val.shape}  (N, 1) CNN probabilities")
+print(f"  deep_embeddings_test.npy  → {deep_test.shape}  (N, 1) CNN probabilities")
+print(f"  best_cnn.pt")
+print("\nStep 6 complete. Update step7_fusion.py before running next.")
